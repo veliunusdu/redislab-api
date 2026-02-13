@@ -15,6 +15,8 @@ async function main() {
     data: { email: 'veli@example.com', name: 'Veli' },
   })
 
+  console.log('Seeded user id:', user.id);
+
   const { raw, prefix } = generateApiKey()
   const keyHash = await bcrypt.hash(raw, 10)
 
