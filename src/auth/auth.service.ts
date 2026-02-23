@@ -19,7 +19,6 @@ export class AuthService {
   ) {}
 
   async login(email: string, password: string) {
-    // For now: keep it simple (learning stage). Later we’ll add bcrypt properly.
     const user = await this.prisma.user.findUnique({
       where: { email },
       select: { id: true, email: true, name: true },
@@ -28,19 +27,60 @@ export class AuthService {
     if (!user) throw new UnauthorizedException('Invalid credentials');
 
     // TODO: verify password via bcrypt once user has passwordHash column.
-    // if (!await bcrypt.compare(password, user.passwordHash)) throw new UnauthorizedException(...)
 
     const sid = randomUUID();
-    const key = Keys.sess.byId(sid);
 
-    // store session -> userId
-    await this.redis.setJson(key, { userId: user.id }, this.ttl);
+    // 1. Store session hash: sess:{sid} -> { userId }
+    await this.redis.setJson(Keys.sess.byId(sid), { userId: user.id }, this.ttl);
+
+    // 2. Track all active sessions for this user: sess:user:{userId} (Set)
+    //    The Set itself has no TTL – individual session keys do.
+    await this.redis.sAdd(Keys.sess.userSet(user.id), sid);
 
     return { sid, user };
   }
 
-  async logout(sid: string) {
+  /**
+   * Logout a single session.
+   * - Deletes the session key from Redis.
+   * - Removes the sid from the user's session Set.
+   * - Adds the sid to the revoked blocklist (same TTL) so in-flight requests
+   *   holding the cookie are rejected even if there's a replication lag.
+   */
+  async logoutSingle(sid: string): Promise<void> {
     if (!sid) return;
+
+    // Read session first so we can clean up the user-Set
+    const session = await this.redis.getJson<{ userId: string }>(Keys.sess.byId(sid));
+
+    // Delete the session key
     await this.redis.del(Keys.sess.byId(sid));
+
+    if (session?.userId) {
+      await this.redis.sRem(Keys.sess.userSet(session.userId), sid);
+    }
+
+    // Add to revoked blocklist with original TTL so any cached copies are rejected
+    await this.redis.set(Keys.sess.revoked(sid), '1', this.ttl);
+  }
+
+  /**
+   * Logout all sessions for a user.
+   * Reads every sid from the user's session Set, deletes each session key,
+   * adds each sid to the revoked blocklist, then deletes the Set itself.
+   */
+  async logoutAll(userId: string): Promise<{ count: number }> {
+    const sids = await this.redis.sMembers(Keys.sess.userSet(userId));
+
+    await Promise.all(
+      sids.map(async (sid) => {
+        await this.redis.del(Keys.sess.byId(sid));
+        await this.redis.set(Keys.sess.revoked(sid), '1', this.ttl);
+      }),
+    );
+
+    await this.redis.del(Keys.sess.userSet(userId));
+
+    return { count: sids.length };
   }
 }

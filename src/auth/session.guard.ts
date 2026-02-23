@@ -1,4 +1,9 @@
-import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
+import {
+  CanActivate,
+  ExecutionContext,
+  Injectable,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { RedisService } from '../redis/redis.service';
 import { Keys } from '../redis/redis.keys';
@@ -18,17 +23,12 @@ export class SessionGuard implements CanActivate {
 
     if (!sid) throw new UnauthorizedException('Missing session');
 
+    // Fast-reject: check revoked blocklist before reading the full session.
+    const isRevoked = await this.redis.exists(Keys.sess.revoked(sid));
+    if (isRevoked) throw new UnauthorizedException('Session revoked');
+
     const session = await this.redis.getJson<{ userId: string }>(Keys.sess.byId(sid));
     if (!session?.userId) throw new UnauthorizedException('Invalid session');
-
-    // debug: show exact userId value and character codes to detect invisible chars
-    try {
-      console.log('[debug] session.userId (raw)', JSON.stringify(session.userId));
-      const codes = Array.from(session.userId).map((c) => c.charCodeAt(0));
-      console.log('[debug] session.userId charCodes', codes);
-    } catch (err) {
-      console.warn('[debug] failed to stringify session.userId', err);
-    }
 
     const user = await this.prisma.user.findUnique({
       where: { id: session.userId },
@@ -36,7 +36,7 @@ export class SessionGuard implements CanActivate {
     });
     if (!user) throw new UnauthorizedException('User not found');
 
-    req.user = user; // attach to request
+    req.user = user;
     return true;
   }
 }
